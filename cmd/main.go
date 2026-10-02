@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"unicode"
 
 	"github.com/charmbracelet/x/term"
 )
@@ -23,12 +24,12 @@ const (
 	LeftArrow
 	RightArrow
 	BackSpace
+	WordBackSpace
 	Enter
 	Escape
 	Unknown
 )
 
-// LINES is now a 2D slice: a slice of lines, where each line is a slice of runes
 var LINES [][]rune
 
 type event struct {
@@ -37,8 +38,8 @@ type event struct {
 }
 
 type editor struct {
-	cx int // Horizontal cursor position (column)
-	cy int // Vertical cursor position (row)
+	cx int
+	cy int
 }
 
 func main() {
@@ -58,16 +59,15 @@ func main() {
 	}
 	defer term.Restore(fd, oldState)
 
-	// Initialize with one empty line so LINES[0] exists
-	LINES = append(LINES, []rune{})
+	fmt.Print("\033[?1049h\033[2J")
 
+	defer fmt.Print("\033[?1049l")
+
+	LINES = append(LINES, []rune{})
 	dataChan := make(chan event)
 	go read(fd, ctx, dataChan)
 
 	ed := editor{cx: 0, cy: 0}
-
-	// Clear the screen and home the cursor at start
-	fmt.Print("\033[2J\033[H")
 	renderAll(ed)
 
 	for ev := range dataChan {
@@ -75,86 +75,114 @@ func main() {
 		case UpArrow:
 			if ed.cy > 0 {
 				ed.cy--
-				// Snap horizontal cursor if the upper line is shorter
 				if ed.cx > len(LINES[ed.cy]) {
 					ed.cx = len(LINES[ed.cy])
 				}
 				renderAll(ed)
 			}
-
 		case DownArrow:
 			if ed.cy < len(LINES)-1 {
 				ed.cy++
-				// Snap horizontal cursor if the lower line is shorter
 				if ed.cx > len(LINES[ed.cy]) {
 					ed.cx = len(LINES[ed.cy])
 				}
 				renderAll(ed)
 			}
-
 		case RightArrow:
 			if ed.cx < len(LINES[ed.cy]) {
 				ed.cx++
 				renderAll(ed)
-			} else if ed.cy < len(LINES)-1 { // Wrap to next line
+			} else if ed.cy < len(LINES)-1 {
 				ed.cy++
 				ed.cx = 0
 				renderAll(ed)
 			}
-
 		case LeftArrow:
 			if ed.cx > 0 {
 				ed.cx--
 				renderAll(ed)
-			} else if ed.cy > 0 { // Wrap to previous line
+			} else if ed.cy > 0 {
 				ed.cy--
 				ed.cx = len(LINES[ed.cy])
 				renderAll(ed)
 			}
-
 		case Char:
 			currentLine := LINES[ed.cy]
-			// Insert rune at ed.cx
-			LINES[ed.cy] = append(currentLine[:ed.cx], append([]rune{ev.Rune}, currentLine[ed.cx:]...)...)
+			newLine := make([]rune, 0, len(currentLine)+1)
+			newLine = append(newLine, currentLine[:ed.cx]...)
+			newLine = append(newLine, ev.Rune)
+			newLine = append(newLine, currentLine[ed.cx:]...)
+			LINES[ed.cy] = newLine
 			ed.cx++
 			renderAll(ed)
-
 		case BackSpace:
 			if ed.cx > 0 {
-				// Standard backspace on the same line
 				currentLine := LINES[ed.cy]
-				LINES[ed.cy] = append(currentLine[:ed.cx-1], currentLine[ed.cx:]...)
+				newLine := make([]rune, 0, len(currentLine)-1)
+				newLine = append(newLine, currentLine[:ed.cx-1]...)
+				newLine = append(newLine, currentLine[ed.cx:]...)
+				LINES[ed.cy] = newLine
 				ed.cx--
 				renderAll(ed)
 			} else if ed.cy > 0 {
-				// Line joining: Backspace at the start of a line
 				prevLineIdx := ed.cy - 1
-				ed.cx = len(LINES[prevLineIdx]) // Cursor moves to end of previous line
-
-				// Append current line content to the previous line
-				LINES[prevLineIdx] = append(LINES[prevLineIdx], LINES[ed.cy]...)
-
-				// Remove the current line from the 2D slice
+				ed.cx = len(LINES[prevLineIdx])
+				mergedLine := make([]rune, 0, len(LINES[prevLineIdx])+len(LINES[ed.cy]))
+				mergedLine = append(mergedLine, LINES[prevLineIdx]...)
+				mergedLine = append(mergedLine, LINES[ed.cy]...)
+				LINES[prevLineIdx] = mergedLine
 				LINES = append(LINES[:ed.cy], LINES[ed.cy+1:]...)
 				ed.cy--
 				renderAll(ed)
 			}
+		case WordBackSpace:
+			if ed.cx > 0 {
+				currentLine := LINES[ed.cy]
 
+				newCx := ed.cx
+
+				for newCx > 0 && unicode.IsSpace(currentLine[newCx-1]) {
+					newCx--
+				}
+
+				for newCx > 0 && !unicode.IsSpace(currentLine[newCx-1]) {
+					newCx--
+				}
+
+				newLine := make([]rune, 0, len(currentLine)-(ed.cx-newCx))
+				newLine = append(newLine, currentLine[:newCx]...)
+				newLine = append(newLine, currentLine[ed.cx:]...)
+				LINES[ed.cy] = newLine
+
+				ed.cx = newCx
+				renderAll(ed)
+			} else if ed.cy > 0 {
+
+				prevLineIdx := ed.cy - 1
+				ed.cx = len(LINES[prevLineIdx])
+				mergedLine := make([]rune, 0, len(LINES[prevLineIdx])+len(LINES[ed.cy]))
+				mergedLine = append(mergedLine, LINES[prevLineIdx]...)
+				mergedLine = append(mergedLine, LINES[ed.cy]...)
+				LINES[prevLineIdx] = mergedLine
+				LINES = append(LINES[:ed.cy], LINES[ed.cy+1:]...)
+				ed.cy--
+				renderAll(ed)
+			}
 		case Enter:
 			currentLine := LINES[ed.cy]
 			remainingText := []rune{}
-
 			if ed.cx < len(currentLine) {
-				// Save text to the right of the cursor
-				remainingText = currentLine[ed.cx:]
-				// Truncate current line at the cursor
+				remainingText = make([]rune, len(currentLine[ed.cx:]))
+				copy(remainingText, currentLine[ed.cx:])
 				LINES[ed.cy] = currentLine[:ed.cx]
 			} else {
 				LINES[ed.cy] = currentLine
 			}
-
-			// Insert a new line directly below the current row
-			LINES = append(LINES[:ed.cy+1], append([][]rune{remainingText}, LINES[ed.cy+1:]...)...)
+			newLines := make([][]rune, 0, len(LINES)+1)
+			newLines = append(newLines, LINES[:ed.cy+1]...)
+			newLines = append(newLines, remainingText)
+			newLines = append(newLines, LINES[ed.cy+1:]...)
+			LINES = newLines
 			ed.cy++
 			ed.cx = 0
 			renderAll(ed)
@@ -163,30 +191,47 @@ func main() {
 }
 
 func renderAll(ed editor) {
-	// 1. Move cursor to top-left home position (\033[H)
-	fmt.Print("\033[H")
+	fmt.Print("\033[H\033[J")
 
-	// 2. Print all lines, clearing old content on each line
+	tabStop := 4
+	visualCx := 0
+
 	for i, line := range LINES {
-		fmt.Print(string(line))
-		fmt.Print("\033[K") // Clear anything remaining to the right
-		if i < len(LINES)-1 {
-			fmt.Print("\r\n")
+		fmt.Printf("\033[%d;1H", i+1)
+
+		var visualLine string
+		currentCol := 0
+
+		for idx, r := range line {
+			if i == ed.cy && idx == ed.cx {
+				visualCx = currentCol
+			}
+
+			if r == '\t' {
+				spaces := tabStop - (currentCol % tabStop)
+				for s := 0; s < spaces; s++ {
+					visualLine += " "
+					currentCol++
+				}
+			} else {
+				visualLine += string(r)
+				currentCol++
+			}
 		}
+
+		if i == ed.cy && ed.cx == len(line) {
+			visualCx = currentCol
+		}
+
+		fmt.Print(visualLine)
 	}
 
-	// 3. Clear any leftover lines below our text if a line was deleted
-	fmt.Print("\r\n\033[J")
-
-	// 4. Reposition the hardware cursor to matches ed.cx and ed.cy
-	// Terminal escape sequences for grid positioning are 1-indexed
-	fmt.Printf("\033[%d;%dH", ed.cy+1, ed.cx+1)
+	fmt.Printf("\033[%d;%dH", ed.cy+1, visualCx+1)
 }
 
 func read(fd uintptr, ctx context.Context, dataChan chan<- event) {
 	defer close(dataChan)
 	reader := bufio.NewReader(os.Stdin)
-
 	for {
 		r, _, err := reader.ReadRune()
 		if err != nil {
@@ -196,12 +241,18 @@ func read(fd uintptr, ctx context.Context, dataChan chan<- event) {
 			fmt.Fprintln(os.Stderr, "read error")
 			break
 		}
-
-		if r == 0x03 { // Ctrl+C
-			// Clean up screen exit
-			fmt.Print("\033[2J\033[H")
-			fmt.Print("exiting...\r\n")
+		if r == 0x03 {
 			break
+		}
+
+		if r == 0x17 {
+			dataChan <- event{Type: WordBackSpace}
+			continue
+		}
+		if r == 0x7f || r == 0x08 {
+
+			dataChan <- event{Type: BackSpace}
+			continue
 		}
 
 		if r == 0x1b {
@@ -222,6 +273,13 @@ func read(fd uintptr, ctx context.Context, dataChan chan<- event) {
 				}
 				continue
 			}
+
+			if err == nil && (peek[0] == 0x7f || peek[0] == 0x08) {
+				reader.Discard(1)
+				dataChan <- event{Type: WordBackSpace}
+				continue
+			}
+
 			dataChan <- event{Type: Escape}
 			continue
 		}
@@ -229,8 +287,8 @@ func read(fd uintptr, ctx context.Context, dataChan chan<- event) {
 		switch r {
 		case '\r', '\n':
 			dataChan <- event{Type: Enter}
-		case 0x7f, 0x08:
-			dataChan <- event{Type: BackSpace}
+		case '\t':
+			dataChan <- event{Type: Char, Rune: '\t'}
 		default:
 			dataChan <- event{Type: Char, Rune: r}
 		}
